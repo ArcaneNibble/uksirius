@@ -1,4 +1,11 @@
-use std::{collections::HashMap, error, fmt, io, net::UdpSocket, time::Duration};
+use std::{
+    collections::HashMap,
+    error, fmt, io,
+    net::UdpSocket,
+    sync::{atomic::AtomicBool, Arc},
+    thread,
+    time::{Duration, SystemTime},
+};
 
 use uuid::Uuid;
 
@@ -63,6 +70,19 @@ fn chop_up_req<'a>(req: &'a str) -> (&'a str, &'a str, &'a str, HashMap<&'a str,
     }
 
     (req_method, req_uri, payload, headers)
+}
+
+fn rtp_thread(stop: Arc<AtomicBool>, rtp_sock: UdpSocket) {
+    rtp_sock.set_read_timeout(None).unwrap();
+    let mut buf = [0; 65536];
+
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let sz = rtp_sock.recv(&mut buf).unwrap();
+        let pkt = &buf[..sz];
+        dbg!(pkt);
+    }
+
+    println!("rtp thread stopped");
 }
 
 #[derive(Debug)]
@@ -209,6 +229,8 @@ Authorization: Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\
 
     let mut our_call_id = None;
 
+    let run_rtp_thread = Arc::new(AtomicBool::new(false));
+
     loop {
         let (sz, _) = sip_sock.recv_from(&mut buf)?;
         let sip_req = std::str::from_utf8(&buf[..sz])?;
@@ -231,6 +253,49 @@ Authorization: Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\
 
             our_call_id = Some(req_headers.get("Call-ID").unwrap().to_string());
 
+            let mut pbx_rtp_addr = None;
+            let mut pbx_rtp_port = None;
+
+            for sdp_line in req_payload.lines() {
+                dbg!(&sdp_line);
+                if sdp_line.starts_with("c=") {
+                    assert!(sdp_line.starts_with("c=IN IP4 "));
+                    assert!(pbx_rtp_addr.is_none());
+                    pbx_rtp_addr = Some(sdp_line.split_at(9).1.trim().to_string());
+                } else if sdp_line.starts_with("m=") {
+                    assert!(pbx_rtp_port.is_none());
+                    let media_bits = sdp_line.split_at(2).1.split(" ").collect::<Vec<_>>();
+                    assert_eq!(media_bits[0], "audio");
+                    assert_eq!(media_bits[2], "RTP/AVP");
+                    assert!(media_bits[3..].contains(&"0"));
+                    pbx_rtp_port = Some(media_bits[1]);
+                }
+            }
+
+            let pbx_rtp = format!("{}:{}", pbx_rtp_addr.unwrap(), pbx_rtp_port.unwrap());
+            println!("rtp for pbx is {}", pbx_rtp);
+
+            // rtp setup for our side
+            let rtp_sock = UdpSocket::bind((LOCAL_IP, 0))?;
+            let rtp_local_addr = rtp_sock.local_addr()?;
+            rtp_sock.connect(pbx_rtp)?;
+            println!("local rtp {}", rtp_local_addr);
+
+            let answered_sdp = format!(
+                "v=0\r
+o=- {ts} {ts} IN IP4 {our_ip}\r
+s=-\r
+c=IN IP4 {our_ip}\r
+t=0 0\r
+m=audio {our_port} RTP/AVP 0\r\n",
+                ts = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                our_ip = LOCAL_IP,
+                our_port = rtp_local_addr.port(),
+            );
+
             let answered_okay = format!(
                 "SIP/2.0 200 OK\r
 CSeq: {cseq}\r
@@ -238,17 +303,25 @@ Call-ID: {call_id}\r
 Via: {via}\r
 From: {from}\r
 To: {to};tag={to_tag}\r
-\r\n",
+Content-Type: application/sdp\r
+\r
+{payload}",
                 cseq = req_headers.get("CSeq").unwrap(),
                 call_id = req_headers.get("Call-ID").unwrap(),
                 via = req_headers.get("Via").unwrap(),
                 from = req_headers.get("From").unwrap(),
                 to = req_headers.get("To").unwrap(),
                 to_tag = Uuid::new_v4(),
+                payload = answered_sdp,
             );
             println!("{}", answered_okay);
 
             sip_sock.send_to(answered_okay.as_bytes(), (SIP_SERV, 5060))?;
+
+            let run_rtp_thread_clone = run_rtp_thread.clone();
+            thread::spawn(move || {
+                rtp_thread(run_rtp_thread_clone, rtp_sock);
+            });
 
             println!("***** WE ANSWERED CALL *****");
         } else if req_method == "BYE" {
@@ -256,6 +329,8 @@ To: {to};tag={to_tag}\r
             if let Some(our_call_id) = &our_call_id {
                 if req_headers.get("Call-ID").unwrap() == our_call_id {
                     println!("***** CALL HANG UP *****");
+
+                    run_rtp_thread.store(true, std::sync::atomic::Ordering::Relaxed);
 
                     let answered_bye = format!(
                         "SIP/2.0 200 OK\r
