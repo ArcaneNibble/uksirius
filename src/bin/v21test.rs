@@ -1,4 +1,5 @@
 use std::{
+    f32::consts::PI,
     fs::File,
     io::{Read, Write},
 };
@@ -13,6 +14,23 @@ fn main() {
     let mut fsk1_f = File::create("fsk1.f32").unwrap();
     let mut fskdiff_f = File::create("fskdiff.f32").unwrap();
     let mut fsk_bits_f = File::create("fsk.txt").unwrap();
+
+    let mut cos_980 = [0.0; 8000 / 300];
+    let mut sin_980 = [0.0; 8000 / 300];
+    let mut cos_1180 = [0.0; 8000 / 300];
+    let mut sin_1180 = [0.0; 8000 / 300];
+
+    for i in 0..cos_980.len() {
+        cos_980[i] = (2.0 * PI * 980.0 / 8000.0 * i as f32).cos();
+        sin_980[i] = (2.0 * PI * 980.0 / 8000.0 * i as f32).sin();
+        cos_1180[i] = (2.0 * PI * 1180.0 / 8000.0 * i as f32).cos();
+        sin_1180[i] = (2.0 * PI * 1180.0 / 8000.0 * i as f32).sin();
+    }
+    dbg!(&cos_980);
+    dbg!(&sin_980);
+
+    /*
+
 
     let biquad_980_a1: f32 = -1.42961999;
     let biquad_980_a2: f32 = 0.99076401;
@@ -34,13 +52,48 @@ fn main() {
     let mut y_prev_980 = [0.0; 2];
     let mut y_prev_1180 = [0.0; 2];
     let mut dc_prev_980 = [0.0; 2];
-    let mut dc_prev_1180 = [0.0; 2];
+    let mut dc_prev_1180 = [0.0; 2];*/
 
     //let mut fsk = SlidingGoertzelDFT::new(25, &[980.0 / 8000.0, 1180.0 / 8000.0]);
-    for inp_u in inp_data {
-        let inp_lin = ulaw_to_f32(inp_u);
+    for inp_idx in 0..inp_data.len() {
+        let mut corr_980_cos = 0.0;
+        let mut corr_980_sin = 0.0;
+        let mut corr_1180_cos = 0.0;
+        let mut corr_1180_sin = 0.0;
+        for i in 0..cos_980.len() {
+            let inp_lin_i = if inp_idx + i >= inp_data.len() {
+                0.0
+            } else {
+                ulaw_to_f32(inp_data[inp_idx + i])
+            };
 
-        let y_980 = inp_lin * biquad_980_b0 + inp_prev[1] * biquad_980_b2
+            corr_980_cos += inp_lin_i * cos_980[i];
+            corr_980_sin += inp_lin_i * sin_980[i];
+            corr_1180_cos += inp_lin_i * cos_1180[i];
+            corr_1180_sin += inp_lin_i * sin_1180[i];
+        }
+
+        let corr_980 = (corr_980_cos * corr_980_cos + corr_980_sin * corr_980_sin).sqrt()
+            / cos_980.len() as f32;
+        let corr_1180 = (corr_1180_cos * corr_1180_cos + corr_1180_sin * corr_1180_sin).sqrt()
+            / cos_980.len() as f32;
+
+        fsk0_f.write_all(&(corr_1180 * 10.0).to_le_bytes()).unwrap();
+        fsk1_f.write_all(&(corr_980 * 10.0).to_le_bytes()).unwrap();
+        fskdiff_f
+            .write_all(&(corr_980 - corr_1180).to_le_bytes())
+            .unwrap();
+
+        // -40 dBm0 is a symbol of 52.15 / 8192
+        if corr_1180 > corr_980 && corr_1180 >= (52.15 / 8192.0) {
+            fsk_bits_f.write(&[b'0']).unwrap();
+        } else if corr_980 > corr_1180 && corr_980 >= (52.15 / 8192.0) {
+            fsk_bits_f.write(&[b'1']).unwrap();
+        } else {
+            fsk_bits_f.write(&[b'x']).unwrap();
+        }
+
+        /*let y_980 = inp_lin * biquad_980_b0 + inp_prev[1] * biquad_980_b2
             - biquad_980_a1 * y_prev_980[0]
             - biquad_980_a2 * y_prev_980[1];
         let y_1180 = inp_lin * biquad_1180_b0 + inp_prev[1] * biquad_1180_b2
@@ -82,7 +135,7 @@ fn main() {
             fsk_bits_f.write(&[b'1']).unwrap();
         } else {
             fsk_bits_f.write(&[b'x']).unwrap();
-        }
+        }*/
 
         /*let mut fskout = [0.0; 4];
         fsk.run(inp_lin, &mut fskout);
