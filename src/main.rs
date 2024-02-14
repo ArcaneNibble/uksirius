@@ -30,13 +30,39 @@ fn chop_up_res<'a>(resp: &'a str) -> (u32, &'a str, HashMap<&'a str, &'a str>) {
             break;
         }
         // dbg!(hdr_line);
-        let mut hdr_split = hdr_line.splitn(2, ":");
-        let hdr_key = hdr_split.next().unwrap().trim();
-        let hdr_val = hdr_split.next().unwrap().trim();
-        headers.insert(hdr_key, hdr_val);
+        let (hdr_key, hdr_val) = hdr_line.split_once(":").unwrap();
+        headers.insert(hdr_key.trim(), hdr_val.trim());
     }
 
     (status_code, status_msg, headers)
+}
+
+fn chop_up_req<'a>(req: &'a str) -> (&'a str, &'a str, &'a str, HashMap<&'a str, &'a str>) {
+    let mut headers = HashMap::new();
+    let (sip, payload) = req.split_once("\r\n\r\n").unwrap();
+    // dbg!(sip, payload);
+
+    let mut lines = sip.split("\r\n");
+
+    let req_line = lines.next().unwrap();
+    let mut req_split = req_line.splitn(3, " ");
+
+    let req_method = req_split.next().unwrap();
+    let req_uri = req_split.next().unwrap();
+    let req_ver = req_split.next().unwrap();
+    assert_eq!(req_ver, "SIP/2.0");
+
+    for hdr_line in lines {
+        if hdr_line.starts_with(" ") {
+            // fixme totally busted with linebreaks
+            todo!();
+        }
+        // dbg!(hdr_line);
+        let (hdr_key, hdr_val) = hdr_line.split_once(":").unwrap();
+        headers.insert(hdr_key.trim(), hdr_val.trim());
+    }
+
+    (req_method, req_uri, payload, headers)
 }
 
 #[derive(Debug)]
@@ -118,11 +144,8 @@ Contact: <sip:{ext}@{sip_local}>\r
     let mut auth_bits = HashMap::new();
     for auth_bit in auth.split_at(7).1.split(",") {
         // dbg!(auth_bit);
-        let mut auth_bit_split = auth_bit.splitn(2, "=");
-        auth_bits.insert(
-            auth_bit_split.next().unwrap().trim(),
-            auth_bit_split.next().unwrap().trim(),
-        );
+        let (auth_bit_k, auth_bit_v) = auth_bit.split_once("=").unwrap();
+        auth_bits.insert(auth_bit_k.trim(), auth_bit_v.trim());
     }
     dbg!(&auth_bits);
     assert_eq!(auth_bits.get("algorithm").unwrap(), &"MD5");
@@ -184,10 +207,121 @@ Authorization: Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\
 
     sip_sock.set_read_timeout(None)?;
 
+    let mut our_call_id = None;
+
     loop {
         let (sz, _) = sip_sock.recv_from(&mut buf)?;
-        let sip_pkt = std::str::from_utf8(&buf[..sz])?;
+        let sip_req = std::str::from_utf8(&buf[..sz])?;
         println!("~~~~~");
-        println!("{}", sip_pkt);
+        println!("{}", sip_req);
+
+        let (req_method, req_uri, req_payload, req_headers) = chop_up_req(sip_req);
+
+        if req_method == "INVITE" {
+            assert_eq!(req_uri, format!("sip:{}@{}", SIP_EXT, sip_local_addr));
+            assert_eq!(req_headers.get("Content-Type").unwrap(), &"application/sdp");
+            let content_len = req_headers
+                .get("Content-Length")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            assert!(req_payload.len() >= content_len);
+
+            let _invite_payload = &req_payload[..content_len];
+
+            our_call_id = Some(req_headers.get("Call-ID").unwrap().to_string());
+
+            let answered_okay = format!(
+                "SIP/2.0 200 OK\r
+CSeq: {cseq}\r
+Call-ID: {call_id}\r
+Via: {via}\r
+From: {from}\r
+To: {to};tag={to_tag}\r
+\r\n",
+                cseq = req_headers.get("CSeq").unwrap(),
+                call_id = req_headers.get("Call-ID").unwrap(),
+                via = req_headers.get("Via").unwrap(),
+                from = req_headers.get("From").unwrap(),
+                to = req_headers.get("To").unwrap(),
+                to_tag = Uuid::new_v4(),
+            );
+            println!("{}", answered_okay);
+
+            sip_sock.send_to(answered_okay.as_bytes(), (SIP_SERV, 5060))?;
+
+            println!("***** WE ANSWERED CALL *****");
+        } else if req_method == "BYE" {
+            assert_eq!(req_uri, format!("sip:{}@{}", SIP_EXT, sip_local_addr));
+            if let Some(our_call_id) = &our_call_id {
+                if req_headers.get("Call-ID").unwrap() == our_call_id {
+                    println!("***** CALL HANG UP *****");
+
+                    let answered_bye = format!(
+                        "SIP/2.0 200 OK\r
+CSeq: {cseq}\r
+Call-ID: {call_id}\r
+Via: {via}\r
+From: {from}\r
+To: {to}\r
+\r\n",
+                        cseq = req_headers.get("CSeq").unwrap(),
+                        call_id = req_headers.get("Call-ID").unwrap(),
+                        via = req_headers.get("Via").unwrap(),
+                        from = req_headers.get("From").unwrap(),
+                        to = req_headers.get("To").unwrap(),
+                    );
+                    println!("{}", answered_bye);
+
+                    sip_sock.send_to(answered_bye.as_bytes(), (SIP_SERV, 5060))?;
+
+                    break;
+                }
+            } else {
+                // dunno
+
+                let dunno_bye = format!(
+                    "SIP/2.0 500 Internal Server Error\r
+CSeq: {cseq}\r
+Call-ID: {call_id}\r
+Via: {via}\r
+From: {from}\r
+To: {to}\r
+\r\n",
+                    cseq = req_headers.get("CSeq").unwrap(),
+                    call_id = req_headers.get("Call-ID").unwrap(),
+                    via = req_headers.get("Via").unwrap(),
+                    from = req_headers.get("From").unwrap(),
+                    to = req_headers.get("To").unwrap(),
+                );
+                println!("{}", dunno_bye);
+
+                sip_sock.send_to(dunno_bye.as_bytes(), (SIP_SERV, 5060))?;
+            }
+        } else if req_method == "ACK" {
+            println!("yeah we should handle this or something");
+        } else {
+            // dunno
+
+            let dunno_resp = format!(
+                "SIP/2.0 500 Internal Server Error\r
+CSeq: {cseq}\r
+Call-ID: {call_id}\r
+Via: {via}\r
+From: {from}\r
+To: {to}\r
+\r\n",
+                cseq = req_headers.get("CSeq").unwrap(),
+                call_id = req_headers.get("Call-ID").unwrap(),
+                via = req_headers.get("Via").unwrap(),
+                from = req_headers.get("From").unwrap(),
+                to = req_headers.get("To").unwrap(),
+            );
+            println!("{}", dunno_resp);
+
+            sip_sock.send_to(dunno_resp.as_bytes(), (SIP_SERV, 5060))?;
+        }
     }
+
+    Ok(())
 }
