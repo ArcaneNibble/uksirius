@@ -323,16 +323,16 @@ pub struct SlidingGoertzelDFT {
     delay_vs: Vec<f32>,
 }
 impl SlidingGoertzelDFT {
-    pub fn new(big_n: u64, ks: &[u64]) -> Self {
-        let num_bins = ks.len();
+    pub fn new(big_n: u64, ks_div_bign: &[f32]) -> Self {
+        let num_bins = ks_div_bign.len();
         let mut cosines = Vec::with_capacity(num_bins);
         let mut sines = Vec::with_capacity(num_bins);
 
         for bin in 0..num_bins {
-            let k = ks[bin];
-            println!("k = {}, N = {}", k, big_n);
+            let k_over_n = ks_div_bign[bin];
+            println!("k/N = {}", k_over_n);
 
-            let x = 2.0 * PI * (k as f32) / (big_n as f32);
+            let x = 2.0 * PI * k_over_n;
             let sin = x.sin();
             let cos = x.cos();
             sines.push(sin);
@@ -443,7 +443,7 @@ impl ModemState {
             // low freqs are 1080 +- 100 Hz = 980 Hz, 1180 Hz
             // this is right in the middle of bins 24/29
             // additional bins are for hanning window
-            v21thing: SlidingGoertzelDFT::new(200, &[23, 24, 25, 28, 29, 30]),
+            v21thing: SlidingGoertzelDFT::new(200, &[]),
         }
     }
 
@@ -563,7 +563,7 @@ mod tests {
     #[ignore = "manually eyeballed"]
     fn goertzel_dft_test() {
         for freq in 0..8 {
-            let mut dft = SlidingGoertzelDFT::new(8, &[0, 1, 2, 3, 4]);
+            let mut dft = SlidingGoertzelDFT::new(8, &[0.0, 1.0, 2.0, 3.0, 4.0]);
             let input = [
                 (0.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
                 (1.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
