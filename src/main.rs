@@ -2,11 +2,13 @@ use std::{
     collections::HashMap,
     error, fmt, io,
     net::UdpSocket,
+    num::Wrapping,
     sync::{atomic::AtomicBool, Arc},
     thread,
     time::{Duration, SystemTime},
 };
 
+use rand::Rng;
 use uuid::Uuid;
 
 const SIP_SERV: &'static str = "10.82.0.1";
@@ -74,12 +76,64 @@ fn chop_up_req<'a>(req: &'a str) -> (&'a str, &'a str, &'a str, HashMap<&'a str,
 
 fn rtp_thread(stop: Arc<AtomicBool>, rtp_sock: UdpSocket) {
     rtp_sock.set_read_timeout(None).unwrap();
-    let mut buf = [0; 65536];
+    let mut txbuf = [0; 65536];
+    let mut rxbuf = [0; 65536];
+
+    let mut rng = rand::thread_rng();
+    let mut our_ts: Wrapping<u32> = rng.gen();
+    let mut our_seq: Wrapping<u16> = rng.gen();
+    let our_ssrc: u32 = rng.gen();
+
+    txbuf[0] = 0b10_0_0_0000;
+    txbuf[1] = 0;
+    txbuf[8..12].copy_from_slice(&our_ssrc.to_be_bytes());
+
+    let mut got_any_remote = false;
+    let mut remote_ts: Wrapping<u32> = Wrapping(0);
+    let mut remote_seq: Wrapping<u16> = Wrapping(0);
+    let mut remote_ssrc: u32 = 0;
 
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-        let sz = rtp_sock.recv(&mut buf).unwrap();
-        let pkt = &buf[..sz];
-        dbg!(pkt);
+        let sz = rtp_sock.recv(&mut rxbuf).unwrap();
+        let pkt = &rxbuf[..sz];
+
+        assert_eq!(pkt[0], 0b10_0_0_0000);
+        assert!(pkt[1] == 0 || pkt[1] == 0x80);
+
+        // dbg!(pkt);
+
+        if !got_any_remote {
+            got_any_remote = true;
+            remote_ts = Wrapping(u32::from_be_bytes(pkt[4..8].try_into().unwrap()));
+            remote_seq = Wrapping(u16::from_be_bytes(pkt[2..4].try_into().unwrap()));
+            remote_ssrc = u32::from_be_bytes(pkt[8..12].try_into().unwrap());
+            println!("ts {} seq {} ssrc {}", remote_ts, remote_seq, remote_ssrc);
+        }
+
+        let rx_ts = u32::from_be_bytes(pkt[4..8].try_into().unwrap());
+        let rx_seq = u16::from_be_bytes(pkt[2..4].try_into().unwrap());
+        let rx_ssrc = u32::from_be_bytes(pkt[8..12].try_into().unwrap());
+
+        if rx_ts != remote_ts.0 || rx_seq != remote_seq.0 {
+            println!("WARN: bad ts or seq");
+            remote_ts = Wrapping(rx_ts);
+            remote_seq = Wrapping(rx_seq);
+        }
+        if rx_ssrc != remote_ssrc {
+            println!("WARN: bad ssrc, ignoring!");
+            continue;
+        }
+
+        let rx_g711 = &pkt[12..];
+        remote_seq += 1;
+        remote_ts += rx_g711.len() as u32;
+
+        txbuf[2..4].copy_from_slice(&our_seq.0.to_be_bytes());
+        txbuf[4..8].copy_from_slice(&our_ts.0.to_be_bytes());
+        txbuf[12..12 + rx_g711.len()].copy_from_slice(rx_g711);
+        our_seq += 1;
+        our_ts += rx_g711.len() as u32;
+        rtp_sock.send(&txbuf[..12 + rx_g711.len()]).unwrap();
     }
 
     println!("rtp thread stopped");

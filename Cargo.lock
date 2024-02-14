@@ -72,6 +72,7 @@ name = "uksirius"
 version = "0.0.0"
 dependencies = [
  "md5",
+ "rand",
  "uuid",
 ]
 
