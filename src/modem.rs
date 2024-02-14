@@ -312,71 +312,6 @@ pub fn f32_to_ulaw(mut fval: f32) -> u8 {
 }
 
 #[derive(Debug)]
-pub struct SlidingGoertzelDFT {
-    // 10.1109/MSP.2003.1184347
-    delay_x: Vec<f32>,
-    delay_x_wptr: usize,
-    num_bins: usize,
-    cosines: Vec<f32>,
-    sines: Vec<f32>,
-    // [z^-1 z^-2] for k_0 | [z^-1 z^-2] for k_1 | ...
-    delay_vs: Vec<f32>,
-}
-impl SlidingGoertzelDFT {
-    pub fn new(big_n: u64, ks_div_bign: &[f32]) -> Self {
-        let num_bins = ks_div_bign.len();
-        let mut cosines = Vec::with_capacity(num_bins);
-        let mut sines = Vec::with_capacity(num_bins);
-
-        for bin in 0..num_bins {
-            let k_over_n = ks_div_bign[bin];
-            println!("k/N = {}", k_over_n);
-
-            let x = 2.0 * PI * k_over_n;
-            let sin = x.sin();
-            let cos = x.cos();
-            sines.push(sin);
-            cosines.push(cos);
-            println!(" cos = {} sin = {}", cos, sin);
-        }
-
-        Self {
-            delay_x: vec![0.0; big_n as usize],
-            delay_x_wptr: 0,
-            num_bins,
-            cosines,
-            sines,
-            delay_vs: vec![0.0; 2 * num_bins],
-        }
-    }
-
-    pub fn run(&mut self, sample: f32, outp: &mut [f32]) {
-        assert_eq!(self.num_bins * 2, outp.len());
-
-        // comb filter
-        let comb_out = sample - self.delay_x[self.delay_x_wptr];
-        self.delay_x[self.delay_x_wptr] = sample;
-        self.delay_x_wptr = (self.delay_x_wptr + 1) % self.delay_x.len();
-        // dbg!(comb_out);
-
-        for bin in 0..self.num_bins {
-            // dbg!(bin);
-            let v_n = comb_out + 2.0 * self.cosines[bin] * self.delay_vs[bin * 2]
-                - self.delay_vs[bin * 2 + 1];
-            // dbg!(v_n);
-
-            let y_n_re = v_n - self.cosines[bin] * self.delay_vs[bin * 2];
-            let y_n_im = self.sines[bin] * self.delay_vs[bin * 2];
-            // dbg!((y_n_re, y_n_im));
-            outp[bin * 2] = y_n_re;
-            outp[bin * 2 + 1] = y_n_im;
-            self.delay_vs[bin * 2 + 1] = self.delay_vs[bin * 2];
-            self.delay_vs[bin * 2] = v_n;
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct AnsAmGen {
     sample_num: u32,
 }
@@ -431,7 +366,6 @@ pub struct ModemState {
     timestamp: u64,
     fsm: ModemFSM,
     ansam: AnsAmGen,
-    v21thing: SlidingGoertzelDFT,
 }
 impl ModemState {
     pub fn new() -> Self {
@@ -439,11 +373,6 @@ impl ModemState {
             timestamp: 0,
             fsm: ModemFSM::AnswerWait,
             ansam: AnsAmGen::new(),
-            // 200 dft bins, so each bin is 8 kHz / 200 = 40 Hz
-            // low freqs are 1080 +- 100 Hz = 980 Hz, 1180 Hz
-            // this is right in the middle of bins 24/29
-            // additional bins are for hanning window
-            v21thing: SlidingGoertzelDFT::new(200, &[]),
         }
     }
 
@@ -459,22 +388,8 @@ impl ModemState {
             ModemFSM::AnsAm => {
                 for inp_u in inp {
                     let inp_lin = ulaw_to_f32(*inp_u);
-                    let mut fskout = [0.0; 12];
-                    self.v21thing.run(inp_lin, &mut fskout);
 
-                    let f1_windowed_re = -0.25 * fskout[0] + 0.5 * fskout[2] - 0.25 * fskout[4];
-                    let f1_windowed_im = -0.25 * fskout[1] + 0.5 * fskout[3] - 0.25 * fskout[5];
-
-                    let f0_windowed_re = -0.25 * fskout[6] + 0.5 * fskout[8] - 0.25 * fskout[10];
-                    let f0_windowed_im = -0.25 * fskout[7] + 0.5 * fskout[9] - 0.25 * fskout[11];
-
-                    let f0_mag_sq =
-                        f0_windowed_re * f0_windowed_re + f0_windowed_im * f0_windowed_im;
-                    let f1_mag_sq =
-                        f1_windowed_re * f1_windowed_re + f1_windowed_im * f1_windowed_im;
-                    // normalize, but div by N/2 because we threw away the symmetric bin
-                    let f0_mag = f0_mag_sq.sqrt() / 100.0;
-                    let f1_mag = f1_mag_sq.sqrt() / 100.0;
+                    // todo
                 }
                 self.timestamp += inp.len() as u64;
                 let _timeout = self.ansam.run(outp);
@@ -557,32 +472,5 @@ mod tests {
         let mut buf = [0u8; 8000 * 6];
         ansam.run(&mut buf);
         dbg_ansam_f.write_all(&buf).unwrap();
-    }
-
-    #[test]
-    #[ignore = "manually eyeballed"]
-    fn goertzel_dft_test() {
-        for freq in 0..8 {
-            let mut dft = SlidingGoertzelDFT::new(8, &[0.0, 1.0, 2.0, 3.0, 4.0]);
-            let input = [
-                (0.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
-                (1.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
-                (2.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
-                (3.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
-                (4.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
-                (5.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
-                (6.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
-                (7.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
-            ];
-            let mut outp = [0.0; 10];
-
-            for inp in input {
-                dft.run(inp, &mut outp);
-            }
-
-            dbg!(outp);
-
-            // fixme the phase might be off somehow?
-        }
     }
 }
