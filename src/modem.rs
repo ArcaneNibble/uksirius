@@ -2,7 +2,7 @@
 // f_s = 8000 Hz
 // 0 dBm0 = 5215/8192 signal value
 
-use std::f32::consts::PI;
+use std::{f32::consts::PI, fs::File, io::Write};
 
 pub const ULAW_0: u8 = 0xff;
 
@@ -281,11 +281,11 @@ const ULAW_TO_F32: [f32; 256] = [
     0.0 / 8192.0,
 ];
 
-fn ulaw_to_f32(ulaw: u8) -> f32 {
+pub fn ulaw_to_f32(ulaw: u8) -> f32 {
     ULAW_TO_F32[ulaw as usize]
 }
 
-fn f32_to_ulaw(mut fval: f32) -> u8 {
+pub fn f32_to_ulaw(mut fval: f32) -> u8 {
     // https://dspguru.com/dsp/tricks/fast-floating-point-to-mu-law-conversion/
     // but modified
 
@@ -309,6 +309,71 @@ fn f32_to_ulaw(mut fval: f32) -> u8 {
     }
 
     mu as u8
+}
+
+#[derive(Debug)]
+pub struct SlidingGoertzelDFT {
+    // 10.1109/MSP.2003.1184347
+    delay_x: Vec<f32>,
+    delay_x_wptr: usize,
+    num_bins: usize,
+    cosines: Vec<f32>,
+    sines: Vec<f32>,
+    // [z^-1 z^-2] for k_0 | [z^-1 z^-2] for k_1 | ...
+    delay_vs: Vec<f32>,
+}
+impl SlidingGoertzelDFT {
+    pub fn new(big_n: u64, ks: &[u64]) -> Self {
+        let num_bins = ks.len();
+        let mut cosines = Vec::with_capacity(num_bins);
+        let mut sines = Vec::with_capacity(num_bins);
+
+        for bin in 0..num_bins {
+            let k = ks[bin];
+            println!("k = {}, N = {}", k, big_n);
+
+            let x = 2.0 * PI * (k as f32) / (big_n as f32);
+            let sin = x.sin();
+            let cos = x.cos();
+            sines.push(sin);
+            cosines.push(cos);
+            println!(" cos = {} sin = {}", cos, sin);
+        }
+
+        Self {
+            delay_x: vec![0.0; big_n as usize],
+            delay_x_wptr: 0,
+            num_bins,
+            cosines,
+            sines,
+            delay_vs: vec![0.0; 2 * num_bins],
+        }
+    }
+
+    pub fn run(&mut self, sample: f32, outp: &mut [f32]) {
+        assert_eq!(self.num_bins * 2, outp.len());
+
+        // comb filter
+        let comb_out = sample - self.delay_x[self.delay_x_wptr];
+        self.delay_x[self.delay_x_wptr] = sample;
+        self.delay_x_wptr = (self.delay_x_wptr + 1) % self.delay_x.len();
+        // dbg!(comb_out);
+
+        for bin in 0..self.num_bins {
+            // dbg!(bin);
+            let v_n = comb_out + 2.0 * self.cosines[bin] * self.delay_vs[bin * 2]
+                - self.delay_vs[bin * 2 + 1];
+            // dbg!(v_n);
+
+            let y_n_re = v_n - self.cosines[bin] * self.delay_vs[bin * 2];
+            let y_n_im = self.sines[bin] * self.delay_vs[bin * 2];
+            // dbg!((y_n_re, y_n_im));
+            outp[bin * 2] = y_n_re;
+            outp[bin * 2 + 1] = y_n_im;
+            self.delay_vs[bin * 2 + 1] = self.delay_vs[bin * 2];
+            self.delay_vs[bin * 2] = v_n;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -366,6 +431,8 @@ pub struct ModemState {
     timestamp: u64,
     fsm: ModemFSM,
     ansam: AnsAmGen,
+    v21thing: SlidingGoertzelDFT,
+    dbg_fsk_dumpf: File,
 }
 impl ModemState {
     pub fn new() -> Self {
@@ -373,6 +440,11 @@ impl ModemState {
             timestamp: 0,
             fsm: ModemFSM::AnswerWait,
             ansam: AnsAmGen::new(),
+            // 200 dft bins, so each bin is 8 kHz / 200 = 40 Hz
+            // low freqs are 1080 +- 100 Hz = 980 Hz, 1180 Hz
+            // this is right in the middle of bins 24/29
+            v21thing: SlidingGoertzelDFT::new(200, &[24, 29]),
+            dbg_fsk_dumpf: File::create("fsk.txt").unwrap(),
         }
     }
 
@@ -386,6 +458,25 @@ impl ModemState {
                 }
             }
             ModemFSM::AnsAm => {
+                for inp_u in inp {
+                    let inp_lin = ulaw_to_f32(*inp_u);
+                    let mut fskout = [0.0; 4];
+                    self.v21thing.run(inp_lin, &mut fskout);
+                    let f1_mag_sq = fskout[0] * fskout[0] + fskout[1] * fskout[1];
+                    let f0_mag_sq = fskout[2] * fskout[2] + fskout[3] * fskout[3];
+                    // normalize, but div by N/2 because we threw away the symmetric bin
+                    let f0_mag = f0_mag_sq.sqrt() / 100.0;
+                    let f1_mag = f1_mag_sq.sqrt() / 100.0;
+
+                    // -40 dBm0 is a symbol of 52.15 / 8192
+                    if f0_mag > f1_mag && f0_mag >= (52.15 / 8192.0) {
+                        self.dbg_fsk_dumpf.write(&[b'0']).unwrap();
+                    } else if f1_mag > f0_mag && f1_mag >= (52.15 / 8192.0) {
+                        self.dbg_fsk_dumpf.write(&[b'1']).unwrap();
+                    } else {
+                        self.dbg_fsk_dumpf.write(&[b'x']).unwrap();
+                    }
+                }
                 self.timestamp += inp.len() as u64;
                 let _timeout = self.ansam.run(outp);
             }
@@ -467,5 +558,32 @@ mod tests {
         let mut buf = [0u8; 8000 * 6];
         ansam.run(&mut buf);
         dbg_ansam_f.write_all(&buf).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manually eyeballed"]
+    fn goertzel_dft_test() {
+        for freq in 0..8 {
+            let mut dft = SlidingGoertzelDFT::new(8, &[0, 1, 2, 3, 4]);
+            let input = [
+                (0.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
+                (1.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
+                (2.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
+                (3.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
+                (4.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
+                (5.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
+                (6.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
+                (7.0 * (freq as f32) / 8.0 * 2.0 * PI).cos(),
+            ];
+            let mut outp = [0.0; 10];
+
+            for inp in input {
+                dft.run(inp, &mut outp);
+            }
+
+            dbg!(outp);
+
+            // fixme the phase might be off somehow?
+        }
     }
 }

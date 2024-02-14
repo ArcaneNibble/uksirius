@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
-    error, fmt, io,
+    error, fmt,
+    fs::File,
+    io::{self, Write},
     net::UdpSocket,
     num::Wrapping,
     sync::{atomic::AtomicBool, Arc},
@@ -11,12 +13,14 @@ use std::{
 use rand::Rng;
 use uuid::Uuid;
 
+use uksirius::modem::{ModemState, ULAW_0};
+
 const SIP_SERV: &'static str = "10.82.0.1";
 const SIP_EXT: &'static str = "1000";
 const LOCAL_IP: &'static str = "10.82.0.152";
 
 const AUTH_USER: &'static str = "R";
-const AUTH_HA1: &'static str = include_str!("auth_dgst");
+const AUTH_HA1: &'static str = include_str!("../auth_dgst");
 
 fn chop_up_res<'a>(resp: &'a str) -> (u32, &'a str, HashMap<&'a str, &'a str>) {
     let mut headers = HashMap::new();
@@ -75,8 +79,13 @@ fn chop_up_req<'a>(req: &'a str) -> (&'a str, &'a str, &'a str, HashMap<&'a str,
 }
 
 fn rtp_thread(stop: Arc<AtomicBool>, rtp_sock: UdpSocket) {
+    let mut dbg_rx_data_f = File::create("rx.ulaw").unwrap();
+    let mut dbg_tx_data_f = File::create("tx.ulaw").unwrap();
+
+    let mut modem = ModemState::new();
+
     rtp_sock.set_read_timeout(None).unwrap();
-    let mut txbuf = [0; 65536];
+    let mut txbuf = [ULAW_0; 65536];
     let mut rxbuf = [0; 65536];
 
     let mut rng = rand::thread_rng();
@@ -127,10 +136,13 @@ fn rtp_thread(stop: Arc<AtomicBool>, rtp_sock: UdpSocket) {
         let rx_g711 = &pkt[12..];
         remote_seq += 1;
         remote_ts += rx_g711.len() as u32;
+        dbg_rx_data_f.write_all(rx_g711).unwrap();
 
         txbuf[2..4].copy_from_slice(&our_seq.0.to_be_bytes());
         txbuf[4..8].copy_from_slice(&our_ts.0.to_be_bytes());
-        txbuf[12..12 + rx_g711.len()].copy_from_slice(rx_g711);
+        let tx_g711 = &mut txbuf[12..12 + rx_g711.len()];
+        modem.process(rx_g711, tx_g711);
+        dbg_tx_data_f.write_all(tx_g711).unwrap();
         our_seq += 1;
         our_ts += rx_g711.len() as u32;
         rtp_sock.send(&txbuf[..12 + rx_g711.len()]).unwrap();
