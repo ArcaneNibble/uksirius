@@ -91,6 +91,7 @@ Call-ID: {call_id}\r
 Via: SIP/2.0/UDP {sip_local};branch=z9hG4bK-{branch}\r
 From: <sip:{ext}@{sip_serv}>;tag={from_tag}\r
 To: <sip:{ext}@{sip_serv}>\r
+Contact: <sip:{ext}@{sip_local}>\r
 \r\n",
         sip_serv = SIP_SERV,
         ext = SIP_EXT,
@@ -157,6 +158,7 @@ Call-ID: {call_id}\r
 Via: SIP/2.0/UDP {sip_local};branch=z9hG4bK-{branch}\r
 From: <sip:{ext}@{sip_serv}>;tag={from_tag}\r
 To: <sip:{ext}@{sip_serv}>\r
+Contact: <sip:{ext}@{sip_local}>\r
 Authorization: Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\",uri=\"sip:{sip_serv}\",opaque=\"{opaque}\",algorithm=MD5,qop=\"auth\",nc=00000001,cnonce=\"a\",response=\"{auth_resp:x}\"\r
 \r\n",
         sip_serv = SIP_SERV,
@@ -180,5 +182,12 @@ Authorization: Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\
     assert_eq!(resp1_status, 200);
     assert_eq!(resp1_hdrs.get("Call-ID").unwrap(), &reg_call_id.to_string());
 
-    Ok(())
+    sip_sock.set_read_timeout(None)?;
+
+    loop {
+        let (sz, _) = sip_sock.recv_from(&mut buf)?;
+        let sip_pkt = std::str::from_utf8(&buf[..sz])?;
+        println!("~~~~~");
+        println!("{}", sip_pkt);
+    }
 }
