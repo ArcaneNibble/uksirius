@@ -432,7 +432,6 @@ pub struct ModemState {
     fsm: ModemFSM,
     ansam: AnsAmGen,
     v21thing: SlidingGoertzelDFT,
-    dbg_fsk_dumpf: File,
 }
 impl ModemState {
     pub fn new() -> Self {
@@ -443,8 +442,8 @@ impl ModemState {
             // 200 dft bins, so each bin is 8 kHz / 200 = 40 Hz
             // low freqs are 1080 +- 100 Hz = 980 Hz, 1180 Hz
             // this is right in the middle of bins 24/29
-            v21thing: SlidingGoertzelDFT::new(200, &[24, 29]),
-            dbg_fsk_dumpf: File::create("fsk.txt").unwrap(),
+            // additional bins are for hanning window
+            v21thing: SlidingGoertzelDFT::new(200, &[23, 24, 25, 28, 29, 30]),
         }
     }
 
@@ -460,22 +459,22 @@ impl ModemState {
             ModemFSM::AnsAm => {
                 for inp_u in inp {
                     let inp_lin = ulaw_to_f32(*inp_u);
-                    let mut fskout = [0.0; 4];
+                    let mut fskout = [0.0; 12];
                     self.v21thing.run(inp_lin, &mut fskout);
-                    let f1_mag_sq = fskout[0] * fskout[0] + fskout[1] * fskout[1];
-                    let f0_mag_sq = fskout[2] * fskout[2] + fskout[3] * fskout[3];
+
+                    let f1_windowed_re = -0.25 * fskout[0] + 0.5 * fskout[2] - 0.25 * fskout[4];
+                    let f1_windowed_im = -0.25 * fskout[1] + 0.5 * fskout[3] - 0.25 * fskout[5];
+
+                    let f0_windowed_re = -0.25 * fskout[6] + 0.5 * fskout[8] - 0.25 * fskout[10];
+                    let f0_windowed_im = -0.25 * fskout[7] + 0.5 * fskout[9] - 0.25 * fskout[11];
+
+                    let f0_mag_sq =
+                        f0_windowed_re * f0_windowed_re + f0_windowed_im * f0_windowed_im;
+                    let f1_mag_sq =
+                        f1_windowed_re * f1_windowed_re + f1_windowed_im * f1_windowed_im;
                     // normalize, but div by N/2 because we threw away the symmetric bin
                     let f0_mag = f0_mag_sq.sqrt() / 100.0;
                     let f1_mag = f1_mag_sq.sqrt() / 100.0;
-
-                    // -40 dBm0 is a symbol of 52.15 / 8192
-                    if f0_mag > f1_mag && f0_mag >= (52.15 / 8192.0) {
-                        self.dbg_fsk_dumpf.write(&[b'0']).unwrap();
-                    } else if f1_mag > f0_mag && f1_mag >= (52.15 / 8192.0) {
-                        self.dbg_fsk_dumpf.write(&[b'1']).unwrap();
-                    } else {
-                        self.dbg_fsk_dumpf.write(&[b'x']).unwrap();
-                    }
                 }
                 self.timestamp += inp.len() as u64;
                 let _timeout = self.ansam.run(outp);
