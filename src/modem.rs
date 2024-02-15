@@ -656,6 +656,7 @@ enum ModemFSM {
     SendingV8JM,
     V8Silence,
     V21Data,
+    V23Data,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -682,6 +683,9 @@ pub struct ModemState {
 
     v21_another_demod: FskDemod,
     v21_another_mod: FskEncoder,
+
+    v23_demod: FskDemod,
+    v23_mod: FskEncoder,
 }
 impl ModemState {
     pub fn new() -> Self {
@@ -699,6 +703,8 @@ impl ModemState {
             v8_waited_samples: 0,
             v21_another_demod: FskDemod::new(300.0, 1180.0, 980.0),
             v21_another_mod: FskEncoder::new(300.0, 1850.0, 1650.0),
+            v23_demod: FskDemod::new(75.0, 450.0, 390.0),
+            v23_mod: FskEncoder::new(1200.0, 2100.0, 1300.0),
         }
     }
 
@@ -904,7 +910,8 @@ impl ModemState {
                     let timeout = self.ansam.run(outp);
                     if timeout {
                         println!("V.8 timed out!");
-                        self.fsm = ModemFSM::V21Data;
+                        // self.fsm = ModemFSM::V21Data;
+                        self.fsm = ModemFSM::V23Data;
                     }
                 }
             }
@@ -972,6 +979,20 @@ impl ModemState {
                     }
                 }
                 self.v21_another_mod.run(outp);
+            }
+            ModemFSM::V23Data => {
+                for inp_u in inp {
+                    let maybe_byte = self.v23_demod.process(*inp_u);
+                    if let Some(b) = maybe_byte {
+                        println!("got 0x{:02X}", b);
+                        if b.is_ascii_alphanumeric() {
+                            self.v23_mod.add_bytes(&[b + 1]);
+                        } else {
+                            self.v23_mod.add_bytes(&[b]);
+                        }
+                    }
+                }
+                self.v23_mod.run(outp);
             }
         }
     }
