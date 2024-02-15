@@ -460,7 +460,9 @@ impl UartDecoder {
             if self.timer == this_bit_stop_sample_time {
                 // stop sampling this bit at 60%
                 match self.state {
-                    UartFSM::WaitStartTransition => unreachable!(),
+                    UartFSM::WaitStartTransition => {
+                        // ignore, bit error at this exact sample
+                    }
                     UartFSM::StartBit => {
                         if self.inprogress_bit != 0 {
                             println!("Framing error (start bit!)");
@@ -517,7 +519,7 @@ pub struct FskEncoder {
     baud: f32,
     freq_0: f32,
     freq_1: f32,
-    sinusoid_phase: u32,
+    phase: f32,
     sample_num: u64,
     sym_num: u64,
     bytes: VecDeque<u16>,
@@ -526,14 +528,14 @@ pub struct FskEncoder {
     working_bit: bool,
 }
 impl FskEncoder {
-    const AMPLITUDE: f32 = 1000.0 / 8192.0;
+    const AMPLITUDE: f32 = 1165.0 / 8192.0;
 
     pub fn new(baud: f32, freq_0: f32, freq_1: f32) -> Self {
         Self {
             baud,
             freq_0,
             freq_1,
-            sinusoid_phase: 0,
+            phase: 0.0,
             sample_num: 0,
             sym_num: 0,
             bytes: VecDeque::new(),
@@ -557,7 +559,7 @@ impl FskEncoder {
         let mut needs_more_data = self.bytes.len() == 0;
         for i in 0..out.len() {
             if self.sample_num >= ((self.sym_num + 1) as f32 * samples_per_symbol).floor() as u64 {
-                println!("new bit time! {}", self.sample_num);
+                // println!("new bit time! {}", self.sample_num);
                 self.sym_num += 1;
 
                 let bit;
@@ -570,7 +572,7 @@ impl FskEncoder {
                         self.cur_byte = self.bytes.pop_front().unwrap();
                         println!("new byte! {:010b}", self.cur_byte);
                         if self.bytes.len() == 0 {
-                            println!("emptied buf!");
+                            // println!("emptied buf!");
                             needs_more_data = true;
                         }
                         bit = self.cur_byte & (1 << 9) != 0;
@@ -583,14 +585,21 @@ impl FskEncoder {
                 self.working_bit = bit;
             }
 
-            let bit = self.working_bit;
-
-            let freq = if bit { self.freq_1 } else { self.freq_0 };
-            let sinusoid =
-                Self::AMPLITUDE * (2.0 * PI * freq * (self.sinusoid_phase as f32) / 8000.0).sin();
+            // println!("bit {}", self.working_bit);
+            let freq = if self.working_bit {
+                self.freq_1
+            } else {
+                self.freq_0
+            };
+            // let sinusoid = Self::AMPLITUDE * (2.0 * PI * freq * (self.phase as f32) / 8000.0).sin();
+            let sinusoid = Self::AMPLITUDE * (2.0 * PI * self.phase).sin();
             let wave_u = f32_to_ulaw(sinusoid);
             out[i] = wave_u;
-            self.sinusoid_phase = (self.sinusoid_phase + 1) % 8000;
+            // self.phase = (self.phase + 1) % 8000;
+            self.phase += freq / 8000.0;
+            if self.phase >= 1.0 {
+                self.phase -= 1.0;
+            }
             self.sample_num += 1;
         }
         needs_more_data
@@ -644,6 +653,7 @@ impl AnsAmGen {
 enum ModemFSM {
     AnswerWait,
     AnsAm,
+    SendingV8JM,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -663,6 +673,8 @@ pub struct ModemState {
     v8_cm_buf0: Vec<u8>,
     v8_cm_buf1: Vec<u8>,
     v8_state: V8FSM,
+    v8_jm: Vec<u8>,
+    v21modthing: FskEncoder,
 }
 impl ModemState {
     pub fn new() -> Self {
@@ -674,6 +686,8 @@ impl ModemState {
             v8_cm_buf0: Vec::new(),
             v8_cm_buf1: Vec::new(),
             v8_state: V8FSM::WaitCM0,
+            v8_jm: Vec::new(),
+            v21modthing: FskEncoder::new(300.0, 1850.0, 1650.0),
         }
     }
 
@@ -687,6 +701,7 @@ impl ModemState {
                 }
             }
             ModemFSM::AnsAm => {
+                let mut switch_state = false;
                 for inp_u in inp {
                     let maybe_byte = self.v21thing.process(*inp_u);
                     if let Some(v8b) = maybe_byte {
@@ -718,6 +733,11 @@ impl ModemState {
                                     if self.v8_cm_buf0 == self.v8_cm_buf1 {
                                         println!("they match!");
 
+                                        let mut _callf0 = None;
+                                        let mut _modn0 = None;
+                                        let mut _modn1 = None;
+                                        let mut _modn2 = None;
+
                                         let mut i = 0;
                                         while i < self.v8_cm_buf0.len() {
                                             let b = self.v8_cm_buf0[i];
@@ -738,8 +758,10 @@ impl ModemState {
                                                         ]
                                                             [(b & 0b111) as usize]
                                                     );
+                                                    _callf0 = Some(b);
                                                 }
                                                 0b10100_000 => {
+                                                    _modn0 = Some(b);
                                                     println!("got modulation:");
                                                     if b & 0b100 != 0 {
                                                         println!("* PCM")
@@ -755,6 +777,7 @@ impl ModemState {
                                                         let b = self.v8_cm_buf0[i + 1];
                                                         if b & 0b000_111_00 == 0b000_010_00 {
                                                             // modn1
+                                                            _modn1 = Some(b);
                                                             // println!("modn1");
                                                             i += 1;
                                                             if b & 0b100_000_00 != 0 {
@@ -777,6 +800,7 @@ impl ModemState {
                                                             let b = self.v8_cm_buf0[i + 1];
                                                             if b & 0b000_111_00 == 0b000_010_00 {
                                                                 // modn2
+                                                                _modn2 = Some(b);
                                                                 // println!("modn2");
                                                                 i += 1;
                                                                 if b & 0b100_000_00 != 0 {
@@ -842,7 +866,7 @@ impl ModemState {
                                             i += 1;
                                         }
 
-                                        todo!()
+                                        switch_state = true;
                                     } else {
                                         println!("they DON'T MATCH!");
                                         mem::swap(&mut self.v8_cm_buf0, &mut self.v8_cm_buf1);
@@ -857,7 +881,36 @@ impl ModemState {
                     }
                 }
                 self.timestamp += inp.len() as u64;
-                let _timeout = self.ansam.run(outp);
+                if switch_state {
+                    println!("starting to send JM");
+                    self.v8_jm = [0xe0, 0xc1, 0x05, 0x10, 0x10].to_vec();
+                    self.v21modthing.add_specials(&[0x3ff]);
+                    self.v21modthing.add_bytes(&self.v8_jm);
+                    let _needs_more = self.v21modthing.run(outp);
+                    // xxx loop around if very long packets?
+                    self.fsm = ModemFSM::SendingV8JM;
+                } else {
+                    let _timeout = self.ansam.run(outp);
+                }
+            }
+            ModemFSM::SendingV8JM => {
+                // detect CJ
+                for inp_u in inp {
+                    let maybe_byte = self.v21thing.process(*inp_u);
+                    if let Some(v8b) = maybe_byte {
+                        let v8b = u8::reverse_bits(v8b);
+                        println!("V.8 get 0{:08b}1", v8b);
+                    }
+                }
+
+                self.timestamp += inp.len() as u64;
+                // xxx switch state
+                let needs_more = self.v21modthing.run(outp);
+                // xxx loop around multiple times if very long packets?
+                if needs_more {
+                    self.v21modthing.add_specials(&[0x3ff]);
+                    self.v21modthing.add_bytes(&self.v8_jm);
+                }
             }
         }
     }
