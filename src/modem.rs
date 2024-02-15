@@ -381,6 +381,126 @@ impl FskDemod {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UartFSM {
+    WaitStartTransition,
+    StartBit,
+    DataBit(u8),
+    StopBit,
+}
+#[derive(Debug)]
+pub struct UartDecoder {
+    state: UartFSM,
+    baud: f32,
+    prev_bit: i8,
+    timer: u32,
+    inprogress_bit: i8,
+    inprogress_byte: u8,
+}
+impl UartDecoder {
+    pub fn new(baud: f32) -> Self {
+        Self {
+            state: UartFSM::WaitStartTransition,
+            baud,
+            prev_bit: -1,
+            timer: 0,
+            inprogress_bit: -1,
+            inprogress_byte: 0,
+        }
+    }
+    pub fn process(&mut self, bit: i8) -> Option<u8> {
+        let samples_per_symbol = 8000.0 / self.baud;
+        let mut ret = None;
+
+        if self.state == UartFSM::WaitStartTransition {
+            if self.prev_bit == 1 && bit == 0 {
+                // println!("Found start bit!");
+                self.timer = 0;
+                self.state = UartFSM::StartBit;
+            }
+        } else {
+            let uart_bit_i = match self.state {
+                UartFSM::WaitStartTransition => unreachable!(),
+                UartFSM::StartBit => 0,
+                UartFSM::DataBit(n) => n + 1,
+                UartFSM::StopBit => 9,
+            };
+            let this_bit_start_sample_time =
+                (samples_per_symbol * ((uart_bit_i as f32) + 0.4)).floor() as u32;
+            let this_bit_stop_sample_time =
+                (samples_per_symbol * ((uart_bit_i as f32) + 0.6)).floor() as u32;
+            let this_bit_end_time =
+                (samples_per_symbol * ((uart_bit_i as f32) + 1.0)).floor() as u32;
+
+            if self.timer == this_bit_start_sample_time {
+                // start sampling this bit at 40%
+                self.inprogress_bit = bit;
+            } else if self.timer >= this_bit_start_sample_time
+                && self.timer < this_bit_stop_sample_time
+            {
+                if bit != self.inprogress_bit {
+                    println!("bit error!");
+                    self.state = UartFSM::WaitStartTransition;
+                }
+            }
+
+            self.timer += 1;
+
+            if self.timer == this_bit_stop_sample_time {
+                // stop sampling this bit at 60%
+                match self.state {
+                    UartFSM::WaitStartTransition => unreachable!(),
+                    UartFSM::StartBit => {
+                        if self.inprogress_bit != 0 {
+                            println!("Framing error (start bit!)");
+                            self.state = UartFSM::WaitStartTransition;
+                        } else {
+                            self.inprogress_byte = 0;
+                        }
+                    }
+                    UartFSM::DataBit(n) => {
+                        debug_assert_ne!(self.inprogress_bit, -1);
+                        self.inprogress_byte |= (self.inprogress_bit as u8) << n;
+                    }
+                    UartFSM::StopBit => {
+                        if self.inprogress_bit != 1 {
+                            println!("Framing error (stop bit!)");
+                            self.state = UartFSM::WaitStartTransition;
+                        }
+                    }
+                }
+            }
+
+            if self.state == UartFSM::StopBit && self.timer >= this_bit_stop_sample_time {
+                // switch early to make sure we don't miss next start bit
+                self.state = UartFSM::WaitStartTransition;
+                // println!(
+                //     "char done! 0x{:02X} 0b{:08b}",
+                //     self.inprogress_byte, self.inprogress_byte
+                // );
+                ret = Some(self.inprogress_byte);
+            } else {
+                if self.timer >= this_bit_end_time {
+                    match self.state {
+                        UartFSM::WaitStartTransition | UartFSM::StopBit => unreachable!(),
+                        UartFSM::StartBit => self.state = UartFSM::DataBit(0),
+                        UartFSM::DataBit(n) => {
+                            if n == 7 {
+                                self.state = UartFSM::StopBit;
+                            } else {
+                                self.state = UartFSM::DataBit(n + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.prev_bit = bit;
+        ret
+    }
+}
+
 #[derive(Debug)]
 pub struct AnsAmGen {
     sample_num: u32,
