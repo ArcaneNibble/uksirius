@@ -2,7 +2,7 @@
 // f_s = 8000 Hz
 // 0 dBm0 = 5215/8192 signal value
 
-use std::{f32::consts::PI, mem};
+use std::{collections::VecDeque, f32::consts::PI, mem};
 
 pub const ULAW_0: u8 = 0xff;
 
@@ -509,6 +509,91 @@ impl UartDecoder {
 
         self.prev_bit = bit;
         ret
+    }
+}
+
+#[derive(Debug)]
+pub struct FskEncoder {
+    baud: f32,
+    freq_0: f32,
+    freq_1: f32,
+    sinusoid_phase: u32,
+    sample_num: u64,
+    sym_num: u64,
+    bytes: VecDeque<u16>,
+    cur_byte: u16,
+    cur_byte_biti: i8,
+    working_bit: bool,
+}
+impl FskEncoder {
+    const AMPLITUDE: f32 = 1000.0 / 8192.0;
+
+    pub fn new(baud: f32, freq_0: f32, freq_1: f32) -> Self {
+        Self {
+            baud,
+            freq_0,
+            freq_1,
+            sinusoid_phase: 0,
+            sample_num: 0,
+            sym_num: 0,
+            bytes: VecDeque::new(),
+            cur_byte: 0,
+            cur_byte_biti: -1,
+            working_bit: true,
+        }
+    }
+    pub fn add_bytes(&mut self, bs: &[u8]) {
+        for b in bs {
+            self.bytes.push_back((u8::reverse_bits(*b) as u16) << 1 | 1);
+        }
+    }
+    pub fn add_specials(&mut self, syms: &[u16]) {
+        for sym in syms {
+            self.bytes.push_back(sym & 0x3FF);
+        }
+    }
+    pub fn run(&mut self, out: &mut [u8]) -> bool {
+        let samples_per_symbol = 8000.0 / self.baud;
+        let mut needs_more_data = self.bytes.len() == 0;
+        for i in 0..out.len() {
+            if self.sample_num >= ((self.sym_num + 1) as f32 * samples_per_symbol).floor() as u64 {
+                println!("new bit time! {}", self.sample_num);
+                self.sym_num += 1;
+
+                let bit;
+                if self.cur_byte_biti == -1 {
+                    if self.bytes.len() == 0 {
+                        // idle
+                        // println!("idle!");
+                        bit = true;
+                    } else {
+                        self.cur_byte = self.bytes.pop_front().unwrap();
+                        println!("new byte! {:010b}", self.cur_byte);
+                        if self.bytes.len() == 0 {
+                            println!("emptied buf!");
+                            needs_more_data = true;
+                        }
+                        bit = self.cur_byte & (1 << 9) != 0;
+                        self.cur_byte_biti = 8;
+                    }
+                } else {
+                    bit = self.cur_byte & (1 << self.cur_byte_biti) != 0;
+                    self.cur_byte_biti -= 1;
+                }
+                self.working_bit = bit;
+            }
+
+            let bit = self.working_bit;
+
+            let freq = if bit { self.freq_1 } else { self.freq_0 };
+            let sinusoid =
+                Self::AMPLITUDE * (2.0 * PI * freq * (self.sinusoid_phase as f32) / 8000.0).sin();
+            let wave_u = f32_to_ulaw(sinusoid);
+            out[i] = wave_u;
+            self.sinusoid_phase = (self.sinusoid_phase + 1) % 8000;
+            self.sample_num += 1;
+        }
+        needs_more_data
     }
 }
 
