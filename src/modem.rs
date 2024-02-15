@@ -2,7 +2,7 @@
 // f_s = 8000 Hz
 // 0 dBm0 = 5215/8192 signal value
 
-use std::{f32::consts::PI, fs::File, io::Write};
+use std::f32::consts::PI;
 
 pub const ULAW_0: u8 = 0xff;
 
@@ -312,6 +312,76 @@ pub fn f32_to_ulaw(mut fval: f32) -> u8 {
 }
 
 #[derive(Debug)]
+pub struct FskDemod {
+    freq_0: f32,
+    freq_1: f32,
+    prev_corr_terms_0_cos: Vec<f32>,
+    prev_corr_terms_0_sin: Vec<f32>,
+    prev_corr_terms_1_cos: Vec<f32>,
+    prev_corr_terms_1_sin: Vec<f32>,
+    corr_0_cos: f32,
+    corr_0_sin: f32,
+    corr_1_cos: f32,
+    corr_1_sin: f32,
+    phase: u32,
+    prev_wptr: usize,
+}
+impl FskDemod {
+    pub fn new(baud: f32, freq_0: f32, freq_1: f32) -> Self {
+        let baud_win_sz = (8000.0 / baud).floor() as usize;
+
+        Self {
+            freq_0,
+            freq_1,
+            prev_corr_terms_0_cos: vec![0.0; baud_win_sz],
+            prev_corr_terms_0_sin: vec![0.0; baud_win_sz],
+            prev_corr_terms_1_cos: vec![0.0; baud_win_sz],
+            prev_corr_terms_1_sin: vec![0.0; baud_win_sz],
+            corr_0_cos: 0.0,
+            corr_0_sin: 0.0,
+            corr_1_cos: 0.0,
+            corr_1_sin: 0.0,
+            phase: 0,
+            prev_wptr: 0,
+        }
+    }
+    pub fn process(&mut self, inp_u: u8) -> (f32, f32) {
+        // absolutely don't do *anything* fancy, just cross-correlation with sinusoids
+        let inp_lin = ulaw_to_f32(inp_u);
+
+        let (sin_0, cos_0) = (2.0 * PI * self.freq_0 / 8000.0 * self.phase as f32).sin_cos();
+        let (sin_1, cos_1) = (2.0 * PI * self.freq_1 / 8000.0 * self.phase as f32).sin_cos();
+
+        self.corr_0_cos -= self.prev_corr_terms_0_cos[self.prev_wptr];
+        self.corr_0_sin -= self.prev_corr_terms_0_sin[self.prev_wptr];
+        self.corr_1_cos -= self.prev_corr_terms_1_cos[self.prev_wptr];
+        self.corr_1_sin -= self.prev_corr_terms_1_sin[self.prev_wptr];
+        let corr_0_cos_term = inp_lin * cos_0;
+        let corr_0_sin_term = inp_lin * sin_0;
+        let corr_1_cos_term = inp_lin * cos_1;
+        let corr_1_sin_term = inp_lin * sin_1;
+        self.corr_0_cos += corr_0_cos_term;
+        self.corr_0_sin += corr_0_sin_term;
+        self.corr_1_cos += corr_1_cos_term;
+        self.corr_1_sin += corr_1_sin_term;
+
+        self.phase = (self.phase + 1) % 8000;
+        self.prev_corr_terms_0_cos[self.prev_wptr] = corr_0_cos_term;
+        self.prev_corr_terms_0_sin[self.prev_wptr] = corr_0_sin_term;
+        self.prev_corr_terms_1_cos[self.prev_wptr] = corr_1_cos_term;
+        self.prev_corr_terms_1_sin[self.prev_wptr] = corr_1_sin_term;
+        self.prev_wptr = (self.prev_wptr + 1) % self.prev_corr_terms_0_cos.len();
+
+        let corr_0 = (self.corr_0_cos * self.corr_0_cos + self.corr_0_sin * self.corr_0_sin).sqrt()
+            / self.prev_corr_terms_0_cos.len() as f32;
+        let corr_1 = (self.corr_1_cos * self.corr_1_cos + self.corr_1_sin * self.corr_1_sin).sqrt()
+            / self.prev_corr_terms_1_cos.len() as f32;
+
+        (corr_0, corr_1)
+    }
+}
+
+#[derive(Debug)]
 pub struct AnsAmGen {
     sample_num: u32,
 }
@@ -366,6 +436,7 @@ pub struct ModemState {
     timestamp: u64,
     fsm: ModemFSM,
     ansam: AnsAmGen,
+    v21thing: FskDemod,
 }
 impl ModemState {
     pub fn new() -> Self {
@@ -373,6 +444,7 @@ impl ModemState {
             timestamp: 0,
             fsm: ModemFSM::AnswerWait,
             ansam: AnsAmGen::new(),
+            v21thing: FskDemod::new(300.0, 1180.0, 980.0),
         }
     }
 
@@ -387,8 +459,7 @@ impl ModemState {
             }
             ModemFSM::AnsAm => {
                 for inp_u in inp {
-                    let inp_lin = ulaw_to_f32(*inp_u);
-
+                    let _todo = self.v21thing.process(*inp_u);
                     // todo
                 }
                 self.timestamp += inp.len() as u64;
