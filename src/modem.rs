@@ -654,6 +654,8 @@ enum ModemFSM {
     AnswerWait,
     AnsAm,
     SendingV8JM,
+    V8Silence,
+    V21Data,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -675,6 +677,8 @@ pub struct ModemState {
     v8_state: V8FSM,
     v8_jm: Vec<u8>,
     v21modthing: FskEncoder,
+    v8_cj_zeros_count: u8,
+    v8_waited_samples: u32,
 }
 impl ModemState {
     pub fn new() -> Self {
@@ -688,6 +692,8 @@ impl ModemState {
             v8_state: V8FSM::WaitCM0,
             v8_jm: Vec::new(),
             v21modthing: FskEncoder::new(300.0, 1850.0, 1650.0),
+            v8_cj_zeros_count: 0,
+            v8_waited_samples: 0,
         }
     }
 
@@ -883,7 +889,7 @@ impl ModemState {
                 self.timestamp += inp.len() as u64;
                 if switch_state {
                     println!("starting to send JM");
-                    self.v8_jm = [0xe0, 0xc1, 0x05, 0x10, 0x10].to_vec();
+                    self.v8_jm = [0xe0, 0xc1, 0x05, 0x10, 0x90].to_vec();
                     self.v21modthing.add_specials(&[0x3ff]);
                     self.v21modthing.add_bytes(&self.v8_jm);
                     let _needs_more = self.v21modthing.run(outp);
@@ -894,23 +900,57 @@ impl ModemState {
                 }
             }
             ModemFSM::SendingV8JM => {
+                let mut switch_state = false;
                 // detect CJ
                 for inp_u in inp {
                     let maybe_byte = self.v21thing.process(*inp_u);
                     if let Some(v8b) = maybe_byte {
                         let v8b = u8::reverse_bits(v8b);
                         println!("V.8 get 0{:08b}1", v8b);
+                        if v8b != 0 {
+                            self.v8_cj_zeros_count = 0;
+                        } else {
+                            self.v8_cj_zeros_count += 1;
+                            if self.v8_cj_zeros_count == 3 {
+                                println!("V.8 got CJ");
+                                switch_state = true;
+                            }
+                        }
                     }
                 }
 
                 self.timestamp += inp.len() as u64;
-                // xxx switch state
-                let needs_more = self.v21modthing.run(outp);
-                // xxx loop around multiple times if very long packets?
-                if needs_more {
-                    self.v21modthing.add_specials(&[0x3ff]);
-                    self.v21modthing.add_bytes(&self.v8_jm);
+                if switch_state {
+                    // xxx switch state
+                    self.v8_waited_samples = outp.len() as u32;
+                    println!(
+                        "need to wait 75 ms 600 samples, already have {} ms {} samples",
+                        1.0 / 8000.0 * self.v8_waited_samples as f32,
+                        self.v8_waited_samples
+                    );
+                    outp.fill(ULAW_0);
+                    self.fsm = ModemFSM::V8Silence;
+                } else {
+                    let needs_more = self.v21modthing.run(outp);
+                    // xxx loop around multiple times if very long packets?
+                    if needs_more {
+                        self.v21modthing.add_specials(&[0x3ff]);
+                        self.v21modthing.add_bytes(&self.v8_jm);
+                    }
                 }
+            }
+            ModemFSM::V8Silence => {
+                outp.fill(ULAW_0);
+                if self.v8_waited_samples + outp.len() as u32 >= 600 {
+                    let start_at = 600 - self.v8_waited_samples;
+                    println!("done waiting, start offset {} of {}", start_at, outp.len());
+                    self.fsm = ModemFSM::V21Data;
+                }
+                self.v8_waited_samples += outp.len() as u32;
+            }
+            ModemFSM::V21Data => {
+                // todo
+                outp.fill(ULAW_0);
             }
         }
     }
