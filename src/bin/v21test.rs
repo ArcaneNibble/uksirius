@@ -5,6 +5,14 @@ use std::{
 
 use uksirius::modem::*;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UartFSM {
+    WaitStartTransition,
+    StartBit,
+    DataBit(u8),
+    StopBit,
+}
+
 fn main() {
     let mut inp_f = File::open("rx.ulaw").unwrap();
     let mut inp_data = Vec::new();
@@ -16,8 +24,14 @@ fn main() {
 
     let mut fsk = FskDemod::new(300.0, 1180.0, 980.0);
 
-    for inp_u in inp_data {
-        let (corr_0, corr_1) = fsk.process(inp_u);
+    let mut prev_bit = -1;
+    let mut uart = UartFSM::WaitStartTransition;
+    let mut uart_timer = 0;
+    let mut uart_inprogress_bit = -1;
+    let mut uart_inprogress_byte = 0u8;
+
+    for (inp_idx, inp_u) in inp_data.iter().enumerate() {
+        let (corr_0, corr_1) = fsk.process(*inp_u);
 
         fsk0_f.write_all(&(corr_0 * 10.0).to_le_bytes()).unwrap();
         fsk1_f.write_all(&(corr_1 * 10.0).to_le_bytes()).unwrap();
@@ -26,13 +40,122 @@ fn main() {
             .unwrap();
 
         // -40 dBm0 is a symbol of 52.15 / 8192
-        if corr_0 > corr_1 && corr_0 >= (52.15 / 8192.0) {
+        let bit = if corr_0 > corr_1 && corr_0 >= (52.15 / 8192.0) {
             fsk_bits_f.write(&[b'0']).unwrap();
+            0
         } else if corr_1 > corr_0 && corr_1 >= (52.15 / 8192.0) {
             fsk_bits_f.write(&[b'1']).unwrap();
+            1
         } else {
             fsk_bits_f.write(&[b'x']).unwrap();
+            -1
+        };
+
+        let samples_per_symbol = 8000f32 / 300.0;
+        // dbg!(samples_per_symbol);
+
+        if uart == UartFSM::WaitStartTransition {
+            if prev_bit == 1 && bit == 0 {
+                println!("Found start bit at sample {}", inp_idx);
+                uart_timer = 0;
+                uart = UartFSM::StartBit;
+            }
+        } else {
+            let uart_bit_i = match uart {
+                UartFSM::WaitStartTransition => unreachable!(),
+                UartFSM::StartBit => 0,
+                UartFSM::DataBit(n) => n + 1,
+                UartFSM::StopBit => 9,
+            };
+            let _this_bit_start_time = (samples_per_symbol * (uart_bit_i as f32)).floor() as u32;
+            let this_bit_start_sample_time =
+                (samples_per_symbol * ((uart_bit_i as f32) + 0.4)).floor() as u32;
+            let this_bit_stop_sample_time =
+                (samples_per_symbol * ((uart_bit_i as f32) + 0.6)).floor() as u32;
+            let this_bit_end_time =
+                (samples_per_symbol * ((uart_bit_i as f32) + 1.0)).floor() as u32;
+            // println!(
+            //     "sample {} of byte, started {} sample [{}-{}) finish {}",
+            //     uart_timer,
+            //     _this_bit_start_time,
+            //     this_bit_start_sample_time,
+            //     this_bit_stop_sample_time,
+            //     this_bit_end_time
+            // );
+
+            if uart_timer == this_bit_start_sample_time {
+                // println!("start sampling! {}", bit);
+                uart_inprogress_bit = bit;
+            } else if uart_timer >= this_bit_start_sample_time
+                && uart_timer < this_bit_stop_sample_time
+            {
+                if bit != uart_inprogress_bit {
+                    println!("bit error!");
+                    uart = UartFSM::WaitStartTransition;
+                }
+            }
+
+            uart_timer += 1;
+
+            if uart_timer == this_bit_stop_sample_time {
+                // println!("uart got bit {}", uart_inprogress_bit);
+                match uart {
+                    UartFSM::WaitStartTransition => unreachable!(),
+                    UartFSM::StartBit => {
+                        if uart_inprogress_bit != 0 {
+                            println!("Framing error (start bit!)");
+                            uart = UartFSM::WaitStartTransition;
+                        } else {
+                            uart_inprogress_byte = 0;
+                        }
+                    }
+                    UartFSM::DataBit(n) => {
+                        debug_assert_ne!(uart_inprogress_bit, -1);
+                        uart_inprogress_byte |= (uart_inprogress_bit as u8) << n;
+                    }
+                    UartFSM::StopBit => {
+                        if uart_inprogress_bit != 1 {
+                            println!("Framing error (stop bit!)");
+                            uart = UartFSM::WaitStartTransition;
+                        }
+                    }
+                }
+            }
+
+            if uart == UartFSM::StopBit && uart_timer >= this_bit_stop_sample_time {
+                // switch early to make sure we don't miss next start bit
+                uart = UartFSM::WaitStartTransition;
+                println!(
+                    "char done! 0x{:02X} 0b{:08b}",
+                    uart_inprogress_byte, uart_inprogress_byte
+                );
+            } else {
+                if uart_timer >= this_bit_end_time {
+                    match uart {
+                        UartFSM::WaitStartTransition | UartFSM::StopBit => unreachable!(),
+                        UartFSM::StartBit => uart = UartFSM::DataBit(0),
+                        UartFSM::DataBit(n) => {
+                            if n == 7 {
+                                uart = UartFSM::StopBit;
+                            } else {
+                                uart = UartFSM::DataBit(n + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            // if uart_timer == (samples_per_symbol * 0.4).floor() as usize {
+            //     // start sampling here
+            //     uart_inprogress = bit;
+            // } else if uart_timer < (samples_per_symbol * 0.6).floor() as usize {
+            //     if bit != uart_inprogress {
+            //         println!("Framing error at sample {}!", inp_idx);
+            //         uart = UartFSM::WaitStartTransition;
+            //     }
+            // } else if uart_timer >
         }
+
+        prev_bit = bit;
 
         /*let y_980 = inp_lin * biquad_980_b0 + inp_prev[1] * biquad_980_b2
             - biquad_980_a1 * y_prev_980[0]
