@@ -325,6 +325,7 @@ pub struct FskDemod {
     corr_1_sin: f32,
     phase: u32,
     prev_wptr: usize,
+    uart_decode: UartDecoder,
 }
 impl FskDemod {
     pub fn new(baud: f32, freq_0: f32, freq_1: f32) -> Self {
@@ -343,9 +344,10 @@ impl FskDemod {
             corr_1_sin: 0.0,
             phase: 0,
             prev_wptr: 0,
+            uart_decode: UartDecoder::new(baud),
         }
     }
-    pub fn process(&mut self, inp_u: u8) -> (f32, f32) {
+    pub fn process(&mut self, inp_u: u8) -> Option<u8> {
         // absolutely don't do *anything* fancy, just cross-correlation with sinusoids
         let inp_lin = ulaw_to_f32(inp_u);
 
@@ -377,7 +379,16 @@ impl FskDemod {
         let corr_1 = (self.corr_1_cos * self.corr_1_cos + self.corr_1_sin * self.corr_1_sin).sqrt()
             / self.prev_corr_terms_1_cos.len() as f32;
 
-        (corr_0, corr_1)
+        // -40 dBm0 is a symbol of 52.15 / 8192
+        let bit = if corr_0 > corr_1 && corr_0 >= (52.15 / 8192.0) {
+            0
+        } else if corr_1 > corr_0 && corr_1 >= (52.15 / 8192.0) {
+            1
+        } else {
+            -1
+        };
+
+        self.uart_decode.process(bit)
     }
 }
 
@@ -579,8 +590,11 @@ impl ModemState {
             }
             ModemFSM::AnsAm => {
                 for inp_u in inp {
-                    let _todo = self.v21thing.process(*inp_u);
-                    // todo
+                    let maybe_byte = self.v21thing.process(*inp_u);
+                    if let Some(v8b) = maybe_byte {
+                        let v8b = u8::reverse_bits(v8b);
+                        println!("V.8 get 0{:08b}1", v8b);
+                    }
                 }
                 self.timestamp += inp.len() as u64;
                 let _timeout = self.ansam.run(outp);
