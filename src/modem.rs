@@ -900,7 +900,7 @@ impl ModemState {
                 self.timestamp += inp.len() as u64;
                 if switch_state {
                     println!("starting to send JM");
-                    self.v8_jm = [0xe0, 0xc1, 0x05, 0x10, 0x14].to_vec();
+                    self.v8_jm = [0xe0, 0xc1, 0x05, 0x10, 0x94].to_vec();
                     self.v21modthing.add_specials(&[0x3ff]);
                     self.v21modthing.add_bytes(&self.v8_jm);
                     let _needs_more = self.v21modthing.run(outp);
