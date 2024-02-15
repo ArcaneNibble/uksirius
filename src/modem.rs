@@ -2,7 +2,7 @@
 // f_s = 8000 Hz
 // 0 dBm0 = 5215/8192 signal value
 
-use std::f32::consts::PI;
+use std::{f32::consts::PI, mem};
 
 pub const ULAW_0: u8 = 0xff;
 
@@ -561,6 +561,13 @@ enum ModemFSM {
     AnsAm,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum V8FSM {
+    WaitCM0,
+    GettingCM0,
+    GettingCM1,
+}
+
 #[derive(Debug)]
 pub struct ModemState {
     // xxx
@@ -568,6 +575,9 @@ pub struct ModemState {
     fsm: ModemFSM,
     ansam: AnsAmGen,
     v21thing: FskDemod,
+    v8_cm_buf0: Vec<u8>,
+    v8_cm_buf1: Vec<u8>,
+    v8_state: V8FSM,
 }
 impl ModemState {
     pub fn new() -> Self {
@@ -576,6 +586,9 @@ impl ModemState {
             fsm: ModemFSM::AnswerWait,
             ansam: AnsAmGen::new(),
             v21thing: FskDemod::new(300.0, 1180.0, 980.0),
+            v8_cm_buf0: Vec::new(),
+            v8_cm_buf1: Vec::new(),
+            v8_state: V8FSM::WaitCM0,
         }
     }
 
@@ -594,6 +607,168 @@ impl ModemState {
                     if let Some(v8b) = maybe_byte {
                         let v8b = u8::reverse_bits(v8b);
                         println!("V.8 get 0{:08b}1", v8b);
+
+                        match self.v8_state {
+                            V8FSM::WaitCM0 => {
+                                if v8b == 0b00000111 {
+                                    self.v8_cm_buf0.push(v8b);
+                                    self.v8_state = V8FSM::GettingCM0;
+                                }
+                            }
+                            V8FSM::GettingCM0 => {
+                                if v8b == 0b00000111 {
+                                    // 1st copy done, this is the start of the second copy
+                                    println!("got one copy of CM {:x?}", self.v8_cm_buf0);
+                                    self.v8_cm_buf1.push(v8b);
+                                    self.v8_state = V8FSM::GettingCM1;
+                                } else {
+                                    self.v8_cm_buf0.push(v8b);
+                                }
+                            }
+                            V8FSM::GettingCM1 => {
+                                if v8b == 0b00000111 {
+                                    // 2nd copy done, somewhere a third copy is coming in
+                                    println!("got second copy of CM {:x?}", self.v8_cm_buf1);
+
+                                    if self.v8_cm_buf0 == self.v8_cm_buf1 {
+                                        println!("they match!");
+
+                                        let mut i = 0;
+                                        while i < self.v8_cm_buf0.len() {
+                                            let b = self.v8_cm_buf0[i];
+
+                                            match b & 0b11111_000 {
+                                                0b10000_000 => {
+                                                    println!(
+                                                        "got call function: {}",
+                                                        [
+                                                            "TBD",
+                                                            "Fax TX",
+                                                            "V.18 Textphone",
+                                                            "data",
+                                                            "H.324 multimedia",
+                                                            "Fax RX",
+                                                            "T.101 Videotext",
+                                                            "extension"
+                                                        ]
+                                                            [(b & 0b111) as usize]
+                                                    );
+                                                }
+                                                0b10100_000 => {
+                                                    println!("got modulation:");
+                                                    if b & 0b100 != 0 {
+                                                        println!("* PCM")
+                                                    }
+                                                    if b & 0b010 != 0 {
+                                                        println!("* V.34 duplex")
+                                                    }
+                                                    if b & 0b001 != 0 {
+                                                        println!("* V.34 half-duplex")
+                                                    }
+
+                                                    if i + 1 < self.v8_cm_buf0.len() {
+                                                        let b = self.v8_cm_buf0[i + 1];
+                                                        if b & 0b000_111_00 == 0b000_010_00 {
+                                                            // modn1
+                                                            // println!("modn1");
+                                                            i += 1;
+                                                            if b & 0b100_000_00 != 0 {
+                                                                println!("* V.32")
+                                                            }
+                                                            if b & 0b010_000_00 != 0 {
+                                                                println!("* V.22")
+                                                            }
+                                                            if b & 0b001_000_00 != 0 {
+                                                                println!("* V.17")
+                                                            }
+                                                            if b & 0b000_000_10 != 0 {
+                                                                println!("* V.29 half-duplex")
+                                                            }
+                                                            if b & 0b000_000_01 != 0 {
+                                                                println!("* V.27ter")
+                                                            }
+                                                        }
+                                                        if i + 1 < self.v8_cm_buf0.len() {
+                                                            let b = self.v8_cm_buf0[i + 1];
+                                                            if b & 0b000_111_00 == 0b000_010_00 {
+                                                                // modn2
+                                                                // println!("modn2");
+                                                                i += 1;
+                                                                if b & 0b100_000_00 != 0 {
+                                                                    println!("* V.26ter")
+                                                                }
+                                                                if b & 0b010_000_00 != 0 {
+                                                                    println!("* V.26bis")
+                                                                }
+                                                                if b & 0b001_000_00 != 0 {
+                                                                    println!("* V.23 duplex")
+                                                                }
+                                                                if b & 0b000_000_10 != 0 {
+                                                                    println!("* V.23 half-duplex")
+                                                                }
+                                                                if b & 0b000_000_01 != 0 {
+                                                                    println!("* V.21")
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                0b01010_000 => {
+                                                    if b & 0b111 == 0b100 {
+                                                        println!("Protocols: V.42 LAPM")
+                                                    } else if b & 0b111 == 0b111 {
+                                                        println!("Protocols: extension")
+                                                    } else {
+                                                        println!(
+                                                            "Protocols: UNKNOWN {:03b}",
+                                                            b & 0b111
+                                                        );
+                                                    }
+                                                }
+                                                0b10110_000 => {
+                                                    println!("got pstn access:");
+                                                    if b & 0b100 != 0 {
+                                                        println!("* caller DCE is cellular")
+                                                    }
+                                                    if b & 0b010 != 0 {
+                                                        println!("* answer DCE is cellular")
+                                                    }
+                                                    if b & 0b001 != 0 {
+                                                        println!("* DCE is on a digital network connection")
+                                                    }
+                                                }
+                                                0b11100_000 => {
+                                                    println!("got pcm availability:");
+                                                    if b & 0b100 != 0 {
+                                                        println!("* V.90 analog")
+                                                    }
+                                                    if b & 0b010 != 0 {
+                                                        println!("* V.90 digital")
+                                                    }
+                                                    if b & 0b001 != 0 {
+                                                        println!("* V.91")
+                                                    }
+                                                }
+                                                _ => {
+                                                    println!("don't know what this is {:08b}", b);
+                                                }
+                                            }
+
+                                            i += 1;
+                                        }
+
+                                        todo!()
+                                    } else {
+                                        println!("they DON'T MATCH!");
+                                        mem::swap(&mut self.v8_cm_buf0, &mut self.v8_cm_buf1);
+                                        self.v8_cm_buf1.clear();
+                                        self.v8_cm_buf1.push(v8b);
+                                    }
+                                } else {
+                                    self.v8_cm_buf1.push(v8b);
+                                }
+                            }
+                        }
                     }
                 }
                 self.timestamp += inp.len() as u64;
