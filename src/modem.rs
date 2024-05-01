@@ -313,22 +313,36 @@ pub fn f32_to_ulaw(mut fval: f32) -> u8 {
 
 #[derive(Debug)]
 pub struct FskDemod {
+    /// Frequency of the tone encoding a 0 bit (Hz)
     freq_0: f32,
+    /// Frequency of the tone encoding a 1 bit (Hz)
     freq_1: f32,
+    /// Window of past values for computing a cross-correlation of the input with a "0" bit sinusoid, cosine phase
     prev_corr_terms_0_cos: Vec<f32>,
+    /// Window of past values for computing a cross-correlation of the input with a "0" bit sinusoid, sine phase
     prev_corr_terms_0_sin: Vec<f32>,
+    /// Window of past values for computing a cross-correlation of the input with a "1" bit sinusoid, cosine phase
     prev_corr_terms_1_cos: Vec<f32>,
+    /// Window of past values for computing a cross-correlation of the input with a "1" bit sinusoid, sine phase
     prev_corr_terms_1_sin: Vec<f32>,
+    /// Resulting computed cross-correlation of input with "0" sinusoid, cosine phase
     corr_0_cos: f32,
+    /// Resulting computed cross-correlation of input with "0" sinusoid, sine phase
     corr_0_sin: f32,
+    /// Resulting computed cross-correlation of input with "1" sinusoid, cosine phase
     corr_1_cos: f32,
+    /// Resulting computed cross-correlation of input with "1" sinusoid, sine phase
     corr_1_sin: f32,
+    /// Phase accumulator, [0-8000)
     phase: u32,
+    /// Write offset into past values arrays
     prev_wptr: usize,
+    /// State machine for decoding start/stop bits
     uart_decode: UartDecoder,
 }
 impl FskDemod {
     pub fn new(baud: f32, freq_0: f32, freq_1: f32) -> Self {
+        // Always look at a sliding (rotating) window containing enough samples for a full symbol
         let baud_win_sz = (8000.0 / baud).floor() as usize;
 
         Self {
@@ -349,24 +363,31 @@ impl FskDemod {
     }
     pub fn process(&mut self, inp_u: u8) -> Option<u8> {
         // absolutely don't do *anything* fancy, just cross-correlation with sinusoids
+
+        // convert to linear
         let inp_lin = ulaw_to_f32(inp_u);
 
+        // generate tone sinusoids
         let (sin_0, cos_0) = (2.0 * PI * self.freq_0 / 8000.0 * self.phase as f32).sin_cos();
         let (sin_1, cos_1) = (2.0 * PI * self.freq_1 / 8000.0 * self.phase as f32).sin_cos();
 
+        // remove the amount that is about to roll out of the window
         self.corr_0_cos -= self.prev_corr_terms_0_cos[self.prev_wptr];
         self.corr_0_sin -= self.prev_corr_terms_0_sin[self.prev_wptr];
         self.corr_1_cos -= self.prev_corr_terms_1_cos[self.prev_wptr];
         self.corr_1_sin -= self.prev_corr_terms_1_sin[self.prev_wptr];
+        // correlation at this sample
         let corr_0_cos_term = inp_lin * cos_0;
         let corr_0_sin_term = inp_lin * sin_0;
         let corr_1_cos_term = inp_lin * cos_1;
         let corr_1_sin_term = inp_lin * sin_1;
+        // accumulate this back into the total
         self.corr_0_cos += corr_0_cos_term;
         self.corr_0_sin += corr_0_sin_term;
         self.corr_1_cos += corr_1_cos_term;
         self.corr_1_sin += corr_1_sin_term;
 
+        // update states
         self.phase = (self.phase + 1) % 8000;
         self.prev_corr_terms_0_cos[self.prev_wptr] = corr_0_cos_term;
         self.prev_corr_terms_0_sin[self.prev_wptr] = corr_0_sin_term;
@@ -374,11 +395,13 @@ impl FskDemod {
         self.prev_corr_terms_1_sin[self.prev_wptr] = corr_1_sin_term;
         self.prev_wptr = (self.prev_wptr + 1) % self.prev_corr_terms_0_cos.len();
 
+        // compute magnitude/energy of correlation
         let corr_0 = (self.corr_0_cos * self.corr_0_cos + self.corr_0_sin * self.corr_0_sin).sqrt()
             / self.prev_corr_terms_0_cos.len() as f32;
         let corr_1 = (self.corr_1_cos * self.corr_1_cos + self.corr_1_sin * self.corr_1_sin).sqrt()
             / self.prev_corr_terms_1_cos.len() as f32;
 
+        // output 0/1 with a hard decision, but only if there is enough energy at all
         // -40 dBm0 is a symbol of 52.15 / 8192
         let bit = if corr_0 > corr_1 && corr_0 >= (52.15 / 8192.0) {
             0
@@ -401,11 +424,17 @@ enum UartFSM {
 }
 #[derive(Debug)]
 pub struct UartDecoder {
+    /// FSM state
     state: UartFSM,
+    /// Baud rate (symbols / second)
     baud: f32,
+    /// Stashing the previously processed bit (to compare against)
     prev_bit: i8,
+    /// Timer for deciding when to sample the input (unit: samples @ 8 kHz)
     timer: u32,
+    /// Bit currently being sampled
     inprogress_bit: i8,
+    /// Byte currently being decoded
     inprogress_byte: u8,
 }
 impl UartDecoder {
@@ -436,6 +465,7 @@ impl UartDecoder {
                 UartFSM::DataBit(n) => n + 1,
                 UartFSM::StopBit => 9,
             };
+            // want to sample all the bits between 40% and 60% of timing window, make sure they all agree
             let this_bit_start_sample_time =
                 (samples_per_symbol * ((uart_bit_i as f32) + 0.4)).floor() as u32;
             let this_bit_stop_sample_time =
@@ -591,11 +621,12 @@ impl FskEncoder {
             } else {
                 self.freq_0
             };
-            // let sinusoid = Self::AMPLITUDE * (2.0 * PI * freq * (self.phase as f32) / 8000.0).sin();
+            // synthesize sinusoid, with this particular form
             let sinusoid = Self::AMPLITUDE * (2.0 * PI * self.phase).sin();
             let wave_u = f32_to_ulaw(sinusoid);
             out[i] = wave_u;
-            // self.phase = (self.phase + 1) % 8000;
+            // doing the computation this way ensures that there is no sharp discontinuity
+            // when switching between 0 and 1 bits
             self.phase += freq / 8000.0;
             if self.phase >= 1.0 {
                 self.phase -= 1.0;
@@ -612,10 +643,10 @@ pub struct AnsAmGen {
 }
 impl AnsAmGen {
     const AMPLITUDE: f32 = 1000.0 / 8192.0;
-    const ANSAM_FREQ: f32 = 2100.0;
-    const MOD_FREQ: f32 = 15.0;
+    const ANSAM_FREQ: f32 = 2100.0; // 2100 Hz carrier
+    const MOD_FREQ: f32 = 15.0; // 15 Hz envelope modulation
     const PHASE_REVERSAL_SAMPLES: u32 = 3600; // 450 ms
-    const TIME_LIMIT: u32 = 5 * 8000;
+    const TIME_LIMIT: u32 = 5 * 8000; // 5 sec
 
     pub fn new() -> Self {
         Self { sample_num: 0 }
