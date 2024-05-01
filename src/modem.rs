@@ -546,15 +546,25 @@ impl UartDecoder {
 
 #[derive(Debug)]
 pub struct FskEncoder {
+    /// Baud rate (symbols / second)
     baud: f32,
+    /// Frequency of the tone encoding a 0 bit (Hz)
     freq_0: f32,
+    /// Frequency of the tone encoding a 1 bit (Hz)
     freq_1: f32,
+    /// Currently accumulated sinusoid phase (radians)
     phase: f32,
+    /// Current sample
     sample_num: u64,
+    /// Current symbol
     sym_num: u64,
+    /// Bytes/symbols to send
     bytes: VecDeque<u16>,
+    /// Current byte/symbol being sent
     cur_byte: u16,
+    /// Current bit index being sent
     cur_byte_biti: i8,
+    /// Current bit value being sent
     working_bit: bool,
 }
 impl FskEncoder {
