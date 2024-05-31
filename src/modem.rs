@@ -1026,11 +1026,12 @@ impl ModemState {
                     let maybe_byte = self.v23_demod.process(*inp_u);
                     if let Some(b) = maybe_byte {
                         println!("got 0x{:02X}", b);
-                        if b.is_ascii_alphanumeric() {
+                        /*if b.is_ascii_alphanumeric() {
                             self.v23_mod.add_bytes(&[b + 1]);
                         } else {
                             self.v23_mod.add_bytes(&[b]);
-                        }
+                        }*/
+                        self.v23_mod.add_bytes(&[b]);
                     }
                 }
                 self.v23_mod.run(outp);

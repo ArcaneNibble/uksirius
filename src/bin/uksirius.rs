@@ -15,12 +15,13 @@ use uuid::Uuid;
 
 use uksirius::modem::{ModemState, ULAW_0};
 
-const SIP_SERV: &'static str = "10.82.0.1";
-const SIP_EXT: &'static str = "1000";
-const LOCAL_IP: &'static str = "10.82.0.152";
+const SIP_SERV: &'static str = "clients.sip.poc.emf.camp";
+const SIP_EXT: &'static str = "9823";
+const LOCAL_IP: &'static str = "151.216.209.19";
 
-const AUTH_USER: &'static str = "R";
-const AUTH_HA1: &'static str = include_str!("../auth_dgst");
+const AUTH_USER: &'static str = "9823";
+const AUTH_PASS: &'static str = include_str!("../auth_pass");
+// const AUTH_HA1: &'static str = include_str!("../auth_dgst");
 
 fn chop_up_res<'a>(resp: &'a str) -> (u32, &'a str, HashMap<&'a str, &'a str>) {
     let mut headers = HashMap::new();
@@ -204,6 +205,7 @@ Via: SIP/2.0/UDP {sip_local};branch=z9hG4bK-{branch}\r
 From: <sip:{ext}@{sip_serv}>;tag={from_tag}\r
 To: <sip:{ext}@{sip_serv}>\r
 Contact: <sip:{ext}@{sip_local}>\r
+Expires: 600\r
 \r\n",
         sip_serv = SIP_SERV,
         ext = SIP_EXT,
@@ -241,21 +243,23 @@ Contact: <sip:{ext}@{sip_local}>\r
     assert!(realm.ends_with("\""));
     let realm = realm.split_at(1).1;
     let realm = realm.split_at(realm.len() - 1).0;
-    assert_eq!(realm, "asterisk");
+    // assert_eq!(realm, "asterisk");
     let nonce = auth_bits.get("nonce").unwrap();
     assert!(nonce.starts_with("\""));
     assert!(nonce.ends_with("\""));
     let nonce = nonce.split_at(1).1;
     let nonce = nonce.split_at(nonce.len() - 1).0;
-    let opaque = auth_bits.get("opaque").unwrap();
+    /*let opaque = auth_bits.get("opaque").unwrap();
     assert!(opaque.starts_with("\""));
     assert!(opaque.ends_with("\""));
     let opaque = opaque.split_at(1).1;
-    let opaque = opaque.split_at(opaque.len() - 1).0;
+    let opaque = opaque.split_at(opaque.len() - 1).0;*/
+    let ha1_data = format!("{}:{}:{}", AUTH_USER, realm, AUTH_PASS);
+    let ha1 = md5::compute(ha1_data.as_bytes());
     let ha2_data = format!("REGISTER:sip:{}", SIP_SERV);
     dbg!(&ha2_data);
     let ha2 = md5::compute(ha2_data.as_bytes());
-    let auth_resp_data = format!("{}:{}:00000001:a:auth:{:x}", AUTH_HA1, nonce, ha2);
+    let auth_resp_data = format!("{:x}:{}:00000001:a:auth:{:x}", ha1, nonce, ha2);
     dbg!(&auth_resp_data);
     let auth_resp = md5::compute(auth_resp_data.as_bytes());
 
@@ -268,7 +272,8 @@ Via: SIP/2.0/UDP {sip_local};branch=z9hG4bK-{branch}\r
 From: <sip:{ext}@{sip_serv}>;tag={from_tag}\r
 To: <sip:{ext}@{sip_serv}>\r
 Contact: <sip:{ext}@{sip_local}>\r
-Authorization: Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\",uri=\"sip:{sip_serv}\",opaque=\"{opaque}\",algorithm=MD5,qop=\"auth\",nc=00000001,cnonce=\"a\",response=\"{auth_resp:x}\"\r
+Expires: 600\r
+Authorization: Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\",uri=\"sip:{sip_serv}\",algorithm=MD5,qop=\"auth\",nc=00000001,cnonce=\"a\",response=\"{auth_resp:x}\"\r
 \r\n",
         sip_serv = SIP_SERV,
         ext = SIP_EXT,
@@ -298,9 +303,9 @@ Authorization: Digest username=\"{username}\",realm=\"{realm}\",nonce=\"{nonce}\
     let run_rtp_thread = Arc::new(AtomicBool::new(false));
 
     loop {
-        let (sz, _) = sip_sock.recv_from(&mut buf)?;
+        let (sz, rx_pkt_addr) = sip_sock.recv_from(&mut buf)?;
         let sip_req = std::str::from_utf8(&buf[..sz])?;
-        println!("~~~~~");
+        println!("~~~~~ from {}", rx_pkt_addr);
         println!("{}", sip_req);
 
         let (req_method, req_uri, req_payload, req_headers) = chop_up_req(sip_req);
@@ -369,6 +374,7 @@ Call-ID: {call_id}\r
 Via: {via}\r
 From: {from}\r
 To: {to};tag={to_tag}\r
+Contact: {contact}\r
 Content-Type: application/sdp\r
 \r
 {payload}",
@@ -377,12 +383,14 @@ Content-Type: application/sdp\r
                 via = req_headers.get("Via").unwrap(),
                 from = req_headers.get("From").unwrap(),
                 to = req_headers.get("To").unwrap(),
+                contact = req_headers.get("Contact").unwrap(),
                 to_tag = Uuid::new_v4(),
                 payload = answered_sdp,
             );
             println!("{}", answered_okay);
 
-            sip_sock.send_to(answered_okay.as_bytes(), (SIP_SERV, 5060))?;
+            // sip_sock.send_to(answered_okay.as_bytes(), (SIP_SERV, 5060))?;
+            sip_sock.send_to(answered_okay.as_bytes(), rx_pkt_addr)?;
 
             let run_rtp_thread_clone = run_rtp_thread.clone();
             thread::spawn(move || {
